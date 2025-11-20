@@ -1,4 +1,5 @@
 user_tokens
 credentials.json
 .env 
-__pycache__
+__pycache__/
+*.pyc

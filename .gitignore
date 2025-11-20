@@ -1,3 +1,4 @@
-user tokens/
-credentials.json/
-.env /
+user_tokens
+credentials.json
+.env 
+__pycache__

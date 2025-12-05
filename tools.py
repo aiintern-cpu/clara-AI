@@ -13,6 +13,9 @@ from typing import List, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
+from dateutil import parser as date_parser 
+
+
 here = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=here / ".env")
 
@@ -38,7 +41,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
-
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
@@ -99,6 +101,7 @@ def ensure_creds_refreshed(user_id: str) -> Optional[Credentials]:
             return None
     return creds
 
+
 def get_service(api_name: str, api_version: str, user_id: str):
     """
     Returns a googleapiclient service object for given user_id.
@@ -119,7 +122,6 @@ def get_service(api_name: str, api_version: str, user_id: str):
 def get_youtube_service():
     """Returns a YouTube service object using the global API key."""
     if not YOUTUBE_API_KEY:
-        logging.warning("YOUTUBE_API_KEY not set. YouTube tools will fail.")
         return None
     try:
         service = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
@@ -173,25 +175,25 @@ def create_calendar_event(user_id: str, topic: str, date: str, time: str, attend
     if not service:
         return "Error: Could not connect to Google Calendar. No credentials for user."
     try:
-        possible_formats = ["%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%m/%d/%Y %H:%M"]
-        start_dt = None
-        full = f"{date} {time}"
-        for fmt in possible_formats:
-            try:
-                start_dt = datetime.datetime.strptime(full, fmt)
-                break
-            except ValueError:
-                continue
-        if not start_dt:
-            return f"Error: could not parse date/time '{date} {time}'. Use formats like YYYY-MM-DD HH:MM."
+
+        full_datetime_str = f"{date} {time}" if time else date
+        
+
+        try:
+            start_dt = date_parser.parse(full_datetime_str, fuzzy=True)
+        except date_parser.ParserError:
+            return f"Error: Could not parse date/time '{full_datetime_str}'. Please specify clearly."
 
         end_dt = start_dt + datetime.timedelta(hours=1)
         attendees_list = [{"email": a.strip()} for a in attendees if "@" in a]
+        
+
+        timezone = "Asia/Kolkata" 
         event = {
             "summary": topic,
             "description": "Created by Clara.",
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Kolkata"},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/KKolkata"},
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
             "attendees": attendees_list,
             "reminders": {"useDefault": True},
         }
@@ -211,8 +213,9 @@ def get_calendar_events(user_id: str, date: str) -> str:
     try:
         start = datetime.datetime.fromisoformat(f"{date}T00:00:00")
         end = datetime.datetime.fromisoformat(f"{date}T23:59:59")
-        time_min = start.isoformat() + "+05:30"
-        time_max = end.isoformat() + "+05:30"
+
+        time_min = start.isoformat() + "Z"
+        time_max = end.isoformat() + "Z"
         events_result = service.events().list(calendarId="primary", timeMin=time_min, timeMax=time_max, singleEvents=True, orderBy="startTime").execute()
         items = events_result.get("items", [])
         if not items:
@@ -230,16 +233,45 @@ def get_calendar_events(user_id: str, date: str) -> str:
 
 @mcp.tool
 def add_todo_task(user_id: str, task: str, due_date: Optional[str] = None, description: Optional[str] = None) -> str:
+    """
+    Adds a todo task. If a due date/time is provided, it is parsed flexibly.
+    """
     service = get_service("tasks", "v1", user_id)
     if not service:
         return "Error: Could not connect to Google Tasks. No credentials for user."
     try:
         body = {"title": task, "notes": description or "Created by Clara."}
+        
         if due_date:
-            body["due"] = f"{due_date}T00:00:00.000Z"
+            try:
+                parsed_dt = date_parser.parse(due_date, fuzzy=True, dayfirst=True)
+                
+
+                if parsed_dt.hour != 0 or parsed_dt.minute != 0 or parsed_dt.second != 0:
+
+                    if parsed_dt.tzinfo is None:
+
+                        local_tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+                        parsed_dt = parsed_dt.replace(tzinfo=local_tz).astimezone(datetime.timezone.utc)
+                    else:
+                        parsed_dt = parsed_dt.astimezone(datetime.timezone.utc)
+                        
+                    body["due"] = parsed_dt.isoformat().replace('+00:00', 'Z')
+                    
+                else:
+
+                    body["due"] = parsed_dt.strftime("%Y-%m-%dT00:00:00.000Z")
+
+            except date_parser.ParserError as pe:
+                logging.error(f"Date Parsing Failed: {pe} for input '{due_date}'")
+                return f"Error: Could not parse the due date/time '{due_date}'. Please simplify the date phrase."
+
         created = service.tasks().insert(tasklist="@default", body=body).execute()
         return f"Success: Task '{task}' was added to your Google Tasks list."
     except HttpError as he:
+
+        if "Invalid value for: Invalid format" in str(he):
+             return f"Error executing tool: The date or time format provided was rejected by Google Tasks. Please simplify or check the date: {due_date}"
         return f"Google API error (Tasks Create): {getattr(he, 'content', str(he))}"
     except Exception as e:
         return f"Error adding task: {e}"
@@ -258,11 +290,14 @@ def get_todo_tasks(user_id: str, due_date: Optional[str] = None) -> str:
         for it in items:
             due = it.get("due")
             title = it.get("title", "No Title")
-            if due and due_date:
+            
+
+            if due_date and due:
                 if due.startswith(due_date):
-                    lines.append(f"- {title} (Due: {due})")
+                    lines.append(f"- {title} (Due: {due[:10]})")
             else:
-                lines.append(f"- {title}" + (f" (Due: {due})" if due else ""))
+                lines.append(f"- {title}" + (f" (Due: {due[:10]})" if due else ""))
+        
         return "Tasks:\n" + "\n".join(lines)
     except HttpError as he:
         return f"Google API error (Tasks Read): {getattr(he, 'content', str(he))}"
@@ -299,11 +334,12 @@ def create_meet_link(user_id: str, topic: str) -> str:
         start = now + datetime.timedelta(minutes=5)
         end = start + datetime.timedelta(minutes=15)
         conference_request_id = f"clara-meet-{uuid.uuid4()}"
+        timezone = "Asia/Kolkata"
         event = {
             "summary": topic,
             "description": "Temporary event by Clara.",
-            "start": {"dateTime": start.isoformat(), "timeZone": "Asia/KGolkata"},
-            "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Kolkata"},
+            "start": {"dateTime": start.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end.isoformat(), "timeZone": timezone},
             "conferenceData": {"createRequest": {"requestId": conference_request_id, "conferenceSolutionKey": {"type": "hangoutsMeet"}}}
         }
         created = service.events().insert(calendarId="primary", body=event, conferenceDataVersion=1).execute()
@@ -315,6 +351,7 @@ def create_meet_link(user_id: str, topic: str) -> str:
                 meet_link = ep.get("uri")
                 break
         try:
+
             service.events().delete(calendarId="primary", eventId=created.get("id")).execute()
         except Exception:
             pass
@@ -365,25 +402,20 @@ def add_note_to_notion(content: str) -> str:
         page_url = response.json().get("url", "No URL returned")
         return f"Success! Note added to Notion. You can see it here: {page_url}"
 
-
     except requests.exceptions.RequestException as e:
-
-        error_message = str(e) 
+        error_message = str(e)
         if e.response:
             try:
-
                 error_body = e.response.json()
                 error_message = error_body.get('message', json.dumps(error_body))
                 logging.error(f"Notion API error (JSON): {error_body}")
             except json.JSONDecodeError:
-
                 error_message = e.response.text
                 logging.error(f"Notion API error (raw text): {error_message}")
         else:
             logging.error(f"Notion API error (no response): {e}")
             
         return f"Error adding note to Notion: {error_message}"
-
     except Exception as e:
         logging.error(f"Unexpected error in Notion tool: {e}")
         return f"An unexpected error occurred: {e}"
@@ -404,14 +436,13 @@ def get_notes_from_notion(limit: int = 5) -> str:
         "Notion-Version": notion_version,
     }
 
-
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     
     payload = {
         "page_size": limit,
         "sorts": [
             {
-                "property": "Created time", 
+                "property": "Created time",
                 "direction": "descending"
             }
         ]
@@ -419,7 +450,7 @@ def get_notes_from_notion(limit: int = 5) -> str:
 
     try:
         response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status() 
+        response.raise_for_status()
         
         data = response.json()
         results = data.get("results", [])
@@ -429,7 +460,6 @@ def get_notes_from_notion(limit: int = 5) -> str:
 
         note_list = []
         for page in results:
-
             note_title = page.get("properties", {}).get("Name", {}).get("title", [{}])[0].get("text", {}).get("content", "Untitled Note")
             note_list.append(f"- {note_title}")
 
@@ -456,10 +486,8 @@ def read_recent_emails(user_id: str, sender_email: str = None, limit: int = 5) -
         return "Error: Could not connect to Gmail. No credentials for user."
 
     try:
-
         query = f"from:{sender_email}" if sender_email else ""
         
-
         results = service.users().messages().list(userId='me', q=query, maxResults=limit).execute()
         messages = results.get('messages', [])
 
@@ -468,10 +496,8 @@ def read_recent_emails(user_id: str, sender_email: str = None, limit: int = 5) -
 
         email_list = []
         for msg in messages:
-
             txt = service.users().messages().get(userId='me', id=msg['id']).execute()
             
-
             headers = txt['payload']['headers']
             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
@@ -499,7 +525,7 @@ def auth_google(user_id: str = Query(..., description="user identifier (e.g. ema
     try:
         flow = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
         creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
-
+        # Save token under safe filename
         save_creds_for_user(user_id, creds)
         return {"status": "ok", "user_id": user_id, "token_file": _token_path(user_id)}
     except Exception as e:

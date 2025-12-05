@@ -1,23 +1,23 @@
 import os
 import logging
 import asyncio
-from typing import Set, Any, List, Optional
+from typing import Set, Any, List, Optional, Dict
 from pathlib import Path
 from dotenv import load_dotenv
 
 from supabase import create_client, Client as SupabaseClient
 
-# load .env explicitly from this file's directory
+
 here = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=here / ".env")
 
-# --- Load environment variables ---
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 supabase_client: Optional[SupabaseClient] = None
 
-# --- Initialize Supabase ---
+
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -28,18 +28,17 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     logging.warning("⚠️ SUPABASE_URL or SUPABASE_SERVICE_KEY not set; Supabase disabled.")
 
-# --- Table names ---
+
 TABLE_PREFS = "clara_user_tool_preferences"
 TABLE_HISTORY = "clara_conversation_history"
 
-# --- Fetch enabled tools based on user_id (FIXED QUERY) ---
+
 async def get_enabled_tools_for_session(user_id: str) -> Set[str]:
     """Return names of tools enabled for this user_id."""
     if not supabase_client:
         return set()
     
     def _query():
-        # Correctly queries the 'user_id' column
         res = supabase_client.table(TABLE_PREFS).select("tool_name, is_enabled").eq("user_id", user_id).execute()
         return getattr(res, "data", []) or []
     
@@ -50,7 +49,25 @@ async def get_enabled_tools_for_session(user_id: str) -> Set[str]:
             enabled.add(r["tool_name"])
     return enabled
 
-# --- NEW: Function to update the preference table ---
+
+async def get_all_tool_status_for_user(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves all tool preference records (tool_name, is_enabled) for a user.
+    Returns: List of dictionaries [{'tool_name': str, 'is_enabled': bool}].
+    """
+    if not supabase_client:
+        return []
+    
+    def _query():
+
+        res = supabase_client.table(TABLE_PREFS).select("tool_name, is_enabled").eq("user_id", user_id).execute()
+
+        return getattr(res, "data", []) or []
+    
+    return await asyncio.to_thread(_query)
+
+
+
 async def set_tool_preference(user_id: str, tool_name: str, is_enabled: bool) -> None:
     """Upsert a tool preference record for a given user."""
     if not supabase_client:
@@ -63,7 +80,6 @@ async def set_tool_preference(user_id: str, tool_name: str, is_enabled: bool) ->
     }
     
     def _upsert():
-        # Upsert operation uses the unique constraint (user_id, tool_name)
         return supabase_client.table(TABLE_PREFS).upsert(
             record, 
             on_conflict="user_id, tool_name"
@@ -71,7 +87,7 @@ async def set_tool_preference(user_id: str, tool_name: str, is_enabled: bool) ->
 
     await asyncio.to_thread(_upsert)
 
-# --- Save conversation history (async wrapper) ---
+
 async def save_history_records_async(records: List[dict]) -> Any:
     """
     Insert chat records into Supabase history table.
@@ -83,7 +99,7 @@ async def save_history_records_async(records: List[dict]) -> Any:
         return supabase_client.table(TABLE_HISTORY).insert(records).execute()
     return await asyncio.to_thread(_insert)
 
-# Optional synchronous helper kept for backwards compatibility
+
 def save_history_records(records: List[dict]) -> Any:
     if not supabase_client:
         return None

@@ -3,17 +3,18 @@ import logging
 import datetime
 import asyncio
 import copy
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-from fastmcp import Client as MCPClient
+from fastmcp import Client as MCPClient 
 
 import supabase_utils
+
 
 here = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=here / ".env")
@@ -41,7 +42,8 @@ except Exception as e:
 
 mcp_client: Optional[MCPClient] = None
 try:
-    mcp_client = mcp_client(transport=MCP_SERVER_URL)
+
+    mcp_client = MCPClient(transport=MCP_SERVER_URL)
     logging.info("FastMCP client initialized for %s", MCP_SERVER_URL)
 except Exception as e:
     logging.error("Failed initializing MCP client: %s", e)
@@ -59,6 +61,11 @@ class PreferenceRequest(BaseModel):
     user_id: str
     tool_name: str 
     is_enabled: bool 
+
+
+class ToolStatus(BaseModel):
+    tool_name: str
+    is_enabled: bool
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -100,15 +107,21 @@ async def chat(req: ChatRequest):
 
     today = datetime.date.today().isoformat()
     system_instruction = (
-        f"You are Clara assistant. The user's email is '{user_email_for_prompt}'. Today's date is EXACTLY {today}. "
-        "You are a helpful assistant capable of managing calendar, tasks, Notion notes, and **reading/sending Gmail**. "
-        "When asked about availability, call both get_calendar_events and get_todo_tasks first.\n\n"
+        f"You are Clara, a professional and proactive personal assistant. The user is '{user_email_for_prompt}'. Today's date is {today}.\n\n"
         
-        "*** CRITICAL RULES FOR HISTORY ***\n"
-        "1. The conversation history provided to you is for CONTEXT ONLY (memory).\n"
-        "2. PAST COMMANDS ARE ALREADY DONE. If you see a request in the history (e.g., 'send email'), assume it was successfully completed. DO NOT execute it again.\n"
-        "3. ONLY execute tools for the VERY LAST message from the user.\n"
-        "4. NEVER combine an old request with a new request."
+        "**CAPABILITIES & PROTOCOL:**\n"
+        "1.  **Goal:** Your primary goal is to efficiently execute calendar, task, and communication actions (Tasks, Calendar, Notion, Gmail).\n"
+        "2.  **Tool Execution:** When a tool call is required, execute it immediately without confirming the parameters with the user.\n"
+        
+        "3.  **Proactivity (FINAL FIX):** ONLY call `get_calendar_events` or `get_todo_tasks` IF the user EXPLICITLY asks about their SCHEDULE, FREE TIME, AVAILABILITY, or WORKLOAD. \n"
+        "4.  **Tool Exclusion:** NEVER use scheduling tools (e.g., `get_todo_tasks`, `get_calendar_events`) when the user asks about: your identity ('who am i'), your capabilities ('what can you do?'), or general chat topics.\n" 
+        "5.  **Clarity:** Always acknowledge the tool execution. If successful, provide a brief, clear confirmation. If the tool reports an error (e.g., 'Error: No valid credentials' or 'Google API error'), **translate the technical error into a simple, helpful English explanation** (e.g., 'I couldn't complete the task. Please ensure the Google Tasks integration is enabled in your settings.').\n\n"
+        
+        "**CRITICAL HISTORY RULES:**\n"
+        "1.  The conversation history is for CONTEXT ONLY (memory).\n"
+        "2.  PAST COMMANDS ARE ALREADY COMPLETED. Do NOT re-execute any command seen in the history.\n"
+        "3.  ONLY execute tools based on the content of the VERY LAST user message.\n"
+        "4.  NEVER combine or infer context from old and new requests."
     )
 
 
@@ -193,7 +206,7 @@ async def chat(req: ChatRequest):
             contents.append(candidate.content)
             contents.append(types.Content(role="function", parts=[function_response_part]))
 
-        final_text = response.text if response.candidates else "Sorry, I couldn't generate a response."
+        final_text = response.text if response.candidates else "Sorry, I couldn't generate a generate response."
         logging.info("FINAL (user=%s): %s", user_id, final_text[:200])
 
 
@@ -250,6 +263,43 @@ async def set_tool_preference_api(req: PreferenceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/get_all_tool_status", response_model=List[ToolStatus])
+async def get_all_tool_status_api(user_id: str = Query(..., description="The ID of the user.")) -> List[Dict[str, Any]]:
+    """
+    Retrieves the enabled/disabled status of ALL tools for a given user.
+    This is used to initialize the front-end toggle switch states.
+    """
+    try:
+
+        db_results = await supabase_utils.get_all_tool_status_for_user(user_id)
+        
+
+        if not mcp_client:
+             raise HTTPException(500, "MCP client not available to fetch tool definitions.")
+        
+
+        async with mcp_client:
+            all_mcp_tools = await mcp_client.list_tools()
+            all_tool_names = {t.name for t in all_mcp_tools}
+        
+
+        user_prefs = {r['tool_name']: r['is_enabled'] for r in db_results}
+        
+        final_status_list = []
+        
+
+        for tool_name in sorted(list(all_tool_names)):
+
+            is_enabled = user_prefs.get(tool_name, True) 
+            final_status_list.append(ToolStatus(tool_name=tool_name, is_enabled=is_enabled))
+            
+
+        return final_status_list
+        
+    except Exception as e:
+        logging.error("Failed to retrieve tool statuses: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 def root():
-    return {"message": "Clara main API running"}
+    return {"message": "Clara running"}
